@@ -89,12 +89,18 @@ struct vocab_word *vocab;
 struct meaning_word *meaning;
 int binary = 0, cbow = 1, debug_mode = 2, window = 5, min_count = 5, num_threads = 12, min_reduce = 1;
 int *vocab_hash, *meaning_hash;
-long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100;
+long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100, semantic_num = 1000;
 long long meaning_size = 0;
 long long train_words = 0, word_count_actual = 0, iter = 5, file_size = 0, classes = 0;
 real alpha = 0.025, starting_alpha, sample = 1e-3;
 real *syn1, *syn1neg, *expTable;
-struct sense *syn0;
+// struct sense *syn0;
+
+real *syn0; // the word embeddings. (vocab_size * layer1_size)
+real *syn_sem; // the semantic vectors. (semantic_num * layer1_size)
+real *proj; // the projection of words to the semantic bases. (vocab_size * semantic_num)
+int *in_list; // whether the words are in the list vocabulary.
+
 clock_t start;
 
 int hs = 0, negative = 5;
@@ -527,13 +533,98 @@ void ReadMeaning() {
   fclose(fin);
 }
 
+
+void ReadProjection()
+{
+  /* This function reads the semantic projections of words
+  ** from the file pointed by `read_semantic_proj`.
+  */
+
+  long long a, b, i, num;
+  char word[MAX_STRING];
+  char c1, c2;
+  real sum, waste;
+  
+  FILE *fi = fopen(read_semantic_proj, "rb");
+
+  if (fi == NULL)
+  {
+    printf("Semantic file not found\n");
+    exit(1);
+  }
+
+  a = posix_memalign((void **)&proj, 128, (long long)vocab_size * semantic_num * sizeof(real));
+  if (proj == NULL)
+  {
+    printf("Memory allocation failed\n");
+    exit(1);
+  }
+
+  in_list = (int *)malloc(vocab_size * sizeof(int));
+  memset(in_list, 0, sizeof(int) * vocab_size);
+  num = 0;
+
+  while (1)
+  {
+    ReadWord(word, fi);
+
+    if (feof(fi))
+      break;
+
+    ++num;
+    if (num % 10000 == 0)
+    {
+      printf("%cHave read %lld0K word projections", 13, num / 10000);
+      fflush(stdout);
+    }
+
+    i = SearchVocab(word);
+    if (i == -1)
+    {
+      for (a = 0; a < semantic_num; ++a)
+        fscanf(fi, "%f", &waste);
+      fscanf(fi, "%c%c", &c1, &c2);
+      continue;
+    }
+
+    if (in_list[i] != 0)
+    {
+      printf("wrong!\n");
+      exit(1);
+    }
+
+    in_list[i] = 1;
+
+    real *temp = &proj[i * semantic_num];
+
+    for (a = 0; a < semantic_num; ++a)
+    {
+      fscanf(fi, "%f", &temp[a]);
+    }
+
+    fscanf(fi, "%c%c", &c1, &c2); // the trailing new line
+  }
+
+  fclose(fi);
+
+  for (a = 0; a < vocab_size * semantic_num; ++a)
+    proj[a] /= 20;
+}
+
+
 // init some data structures
 void InitNet() {
   long long a, b;
-  a = posix_memalign((void **)&syn0, 128, (long long)vocab_size * sizeof(struct sense));
+  a = posix_memalign((void **)&syn0, 128, (long long)vocab_size * layer1_size * sizeof(real));
   if (syn0 == NULL) {printf("Memory allocation failed\n"); exit(1);}
-  a = posix_memalign((void **)&meaning_syn, 128, (long long)meaning_size * layer1_size * sizeof(real));
-  if (meaning_syn == NULL) {printf("Memory allocation failed\n"); exit(1);}
+
+  a = posix_memalign((void **)&syn_sem, 128, (long long)semantic_num * layer1_size * sizeof(real));
+  if (syn_sem == NULL)
+  {
+    printf("Memory allocation failed\n");
+    exit(1);
+  }
+
   if (hs) {
     a = posix_memalign((void **)&syn1, 128, (long long)vocab_size * layer1_size * sizeof(real));
     if (syn1 == NULL) {printf("Memory allocation failed\n"); exit(1);}
@@ -546,29 +637,26 @@ void InitNet() {
     for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
      syn1neg[a * layer1_size + b] = 0;
   }
-  for (a = 0; a < meaning_size; a++) for (b = 0; b < layer1_size; b++) {
-    next_random = next_random * (unsigned long long)25214903917 + 11;
-    meaning_syn[a * layer1_size + b] = (((next_random & 0xFFFF) / (real)65536) - 0.5) / layer1_size;
-  }
-  CreateBinaryTree();
-  char *word = (char *)calloc(MAX_STRING, sizeof(char));
-  int *rank = (int *)calloc(111, sizeof(int));
-  int *cnt = (int *)calloc(111, sizeof(int));
-  FILE *fi = fopen(read_sense_file, "r");
-  for (a = 0; a < vocab_size; a++) {
-    ReadSenseWord(word, fi, rank, cnt);
-  }
-  free(word);
-  free(rank);
-  free(cnt);
-  fclose(fi);
+  for (a = 0; a < vocab_size; ++a)
+    for (b = 0; b < layer1_size; ++b)
+    {
+      next_random = next_random * (unsigned long long)25214903917 + 11;
+      syn0[a * layer1_size + b] = (((next_random & 0xFFFF) / (real)65536) - 0.5) / layer1_size;
+    }
+
+  for (a = 0; a < semantic_num; ++a)
+    for (b = 0; b < layer1_size; ++b)
+    {
+      next_random = next_random * (unsigned long long)25214903917 + 11;
+      syn_sem[a * layer1_size + b] = (((next_random & 0xFFFF) / (real)65536) - 0.5) / layer1_size;
+    }
 }
 
 void *TrainModelThread(void *id) {
   long long a, b, d, cw, word, last_word, sentence_length = 0, sentence_position = 0;
   int p, q;
   long long word_count = 0, last_word_count = 0, sen[MAX_SENTENCE_LENGTH + 1];
-  long long l1, l2, c, target, label, local_iter = iter;
+  long long l1, l2, l3, l4, c, target, label, local_iter = iter;
   real f, g;
   clock_t now;
   real *neu1 = (real *)calloc(layer1_size, sizeof(real));
@@ -641,6 +729,23 @@ void *TrainModelThread(void *id) {
       last_word = sen[c];
       if (last_word == -1) continue;
       l1 = last_word * layer1_size;
+      l3 = last_word * semantic_num;
+
+      if (in_list[last_word] > 0)
+      {
+        for (c = 0; c < layer1_size; ++c)
+          syn0[l1 + c] = 0;
+        
+        for (p = 0; p < semantic_num; ++p)
+        {
+          l4 = p * layer1_size;
+          for (c = 0; c < layer1_size; ++c)
+            syn0[l1 + c] += proj[l3 + p] * syn_sem[l4 + c];
+        }
+      }
+
+      for (c = 0; c < layer1_size; ++c)
+        neu1e[c] = 0;
 
       // NEGATIVE SAMPLING
       if (negative > 0) for (d = 0; d < negative + 1; d++) {
@@ -656,51 +761,43 @@ void *TrainModelThread(void *id) {
         }
         l2 = target * layer1_size;
         f = 0;
-        if (syn0[target].num == 1) { // If there is only one sense for a word, then directly select this sense embedding as word representation.
-          for (p = 0; p < layer1_size; ++p) attention[p] = syn0[target].mult_sense_value[p];
-        }
-        else { // more than one sense
-          for (c = 0; c < layer1_size; ++c)
-          	attention[c] = 0;
-		  for (q = 0; q < syn0[target].meaning_word_cnt[syn0[target].num - 1]; ++q) { // sum all the sememe embeddings
-  			real *temp = &(meaning_syn[syn0[target].meaning_word_rank[q] * layer1_size]);
-  			for (c = 0; c < layer1_size; ++c) {
-  				attention[c] += temp[c];
-  			}
-		  }
-          real _cnt = 1.0 / (real)(syn0[target].meaning_word_cnt[syn0[target].num - 1]);
-          for (c = 0; c < layer1_size; ++c) // calc the average embedding
-            	attention[c] *= _cnt;
-        }
-        //BP
-        for (c = 0; c < layer1_size; c++) {
-          f += syn1neg[c + l1] * attention[c];
-        }
-        if (f > MAX_EXP) 
-          g = (label - 1) * alpha;
-        else if (f < -MAX_EXP) 
-          g = (label - 0) * alpha;
-        else 
-          g = (label - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
-        for (c = 0; c < layer1_size; c++) {
-          neu1e[c] = g * attention[c];
-        }
-        if (syn0[target].num == 1) { // only one sense
-          for (p = 0; p < layer1_size; ++p)
-            syn0[target].mult_sense_value[p] += g * syn1neg[p + l1];
-        }
-        else { // more than one sense
-          real _cnt = g / (real)(syn0[target].meaning_word_cnt[syn0[target].num - 1]);
-          for (q = 0; q < syn0[target].meaning_word_cnt[syn0[target].num - 1]; ++q) {
-			   real *temp = &(meaning_syn[syn0[target].meaning_word_rank[q] * layer1_size]);
-      			for (c = 0; c < layer1_size; ++c) {
-      				temp[c] += _cnt * syn1neg[c + l1];
-      			}
-	      }
+        // FP
+        for (c = 0; c < layer1_size; ++c)
+        {
+          f += syn0[l1 + c] * syn1neg[l2 + c];
         }
 
-        for (c = 0; c < layer1_size; c++) {
-          syn1neg[c + l1] += neu1e[c];
+        if (f > MAX_EXP)
+          g = (label - 1) * alpha;
+        else if (f < -MAX_EXP)
+          g = (label - 0) * alpha;
+        else
+          g = (label - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
+
+        // accumulate the gradients over negative samples
+        for (c = 0; c < layer1_size; ++c)
+          neu1e[c] += g * syn1neg[c + l2];
+
+        // BP for the output layer
+        for (c = 0; c < layer1_size; ++c)
+          syn1neg[c + l2] += g * syn0[l1 + c];
+      }
+      // BP
+      if (in_list[last_word] == 0) // if input word in not in the list, only updates the word embedding
+      {
+        for (c = 0; c < layer1_size; ++c)
+          syn0[l1 + c] += neu1e[c];
+      }
+
+      else // update the semantic embeddings
+      {
+        for (p = 0; p < semantic_num; ++p)
+        {
+          l4 = p * layer1_size;
+          for (c = 0; c < layer1_size; ++c)
+          {
+            syn_sem[c + l4] += proj[l3 + p] * neu1e[c];
+          }
         }
       }
     }
